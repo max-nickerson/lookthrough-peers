@@ -1,4 +1,4 @@
-﻿# lookthrough-peers
+# lookthrough-peers
 
 Look-through of Brazilian fund portfolios using Mais Retorno's public portfolio data (sourced from CVM/CDA).
 
@@ -19,9 +19,13 @@ python lookthrough_peers.py
 - `evolucao`: the category-by-month table behind the charts
 - `top10`: top 10 assets per category across all funds (latest month of each)
 - one sheet per fund: month > category > assets, as collapsible row groups
-- `dados`: flat table, one row per holding path
+`lookthrough_peers_dados.csv` (`;` separated, `,` decimals): flat table, one row per holding path.
 
-API responses are cached in `cache_maisretorno/`, so reruns only fetch new months.
+## Speed and reliability
+
+- API responses are cached in one SQLite file (`cache_maisretorno.sqlite`). Monthly portfolios are fetched once; the list of available months is refreshed daily. A rerun from cache takes well under 2 minutes.
+- Requests use 3 threads with reused connections. Going faster gets the client temporarily blocked by the site (HTTP 403), so speed comes from the cache, not more threads.
+- On 403/429/5xx the script waits and retries (5s, 20s, 60s, 120s). Fund-months that still fail are retried once more at the end, one at a time; anything left is listed as `ATENCAO`, and a rerun later only fetches what is missing.
 
 ## Notes
 

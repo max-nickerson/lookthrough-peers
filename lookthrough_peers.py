@@ -2,18 +2,19 @@
 Look-through das carteiras de fundos (fonte: Mais Retorno, dados CVM/CDA).
 Abre recursivamente toda cota de fundo que tenha carteira aberta; a que nao tiver vira ativo final
 (categoria FIDC / FIAGRO / Cotas de Fundos). % final = produto dos % ao longo da cadeia.
-Saida (lookthrough_peers.xlsx):
-  <peer>     mes > categoria > ativos (linhas agrupadas, clique no +)
-  evolucao   % do PL por categoria, mes a mes, por peer  +  graficos
-  top10      top 10 ativos por categoria (ultimo mes de cada peer), entre todos os peers
-  dados      tabela plana (uma linha por caminho ate o ativo)
+Saida:
+  lookthrough_peers.xlsx
+    graficos   % do PL por categoria ao longo do tempo, um grafico por peer
+    evolucao   dados dos graficos (mes x categoria)
+    top10      top 10 ativos por categoria (ultimo mes de cada peer), entre todos os peers
+    <peer>     mes > categoria > ativos (linhas agrupadas, clique no +)
+  lookthrough_peers_dados.csv   tabela plana (uma linha por caminho ate o ativo)
 """
 import json
-import os
 import re
+import sqlite3
 import threading
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
@@ -24,7 +25,7 @@ from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.chart import AreaChart, Reference
 from openpyxl.styles import Font, PatternFill
-from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.utils.indexed_list import IndexedList
 
 PEERS = {                       # nome: link do Mais Retorno OU CNPJ
     "DUAL": "https://maisretorno.com/fundo/itau-dual-private-markets-multimercado-cp-fif-rl",
@@ -35,52 +36,52 @@ PEERS = {                       # nome: link do Mais Retorno OU CNPJ
 }
 DESDE = None                    # ex "2025-01" para limitar; None = desde a carteira mais antiga
 OUT = "lookthrough_peers.xlsx"
-THREADS = 4
+THREADS = 3                     # o site bloqueia (403) se for rapido demais: a velocidade vem do cache, nao de mais threads
 
 API = "https://data.maisretorno.com/mr-data/v4/fund"
 H = {"User-Agent": "Mozilla/5.0", "Referer": "https://maisretorno.com"}
-CACHE = Path("cache_maisretorno")
-CACHE.mkdir(exist_ok=True)
+
+# cache num unico arquivo SQLite (milhares de .json soltos ficam lentos, principalmente no OneDrive)
+DB = sqlite3.connect("cache_maisretorno.sqlite", check_same_thread=False)
+DB.execute("CREATE TABLE IF NOT EXISTS c (k TEXT PRIMARY KEY, v TEXT)")
+MEM, LOCK, LOCAL = {}, threading.Lock(), threading.local()
 
 
-MEM, LOCK = {}, threading.Lock()
+class Falha(Exception):              # resposta nao definitiva (bloqueio/erro): nao vira "carteira vazia"
+    pass
 
 
 def get(path):
-    with LOCK:
-        if path in MEM:
-            return MEM[path]
-    MEM[path] = data = fetch(path)
-    return data
-
-
-def fetch(path):
     # carteiras mensais nao mudam: cache permanente; lista de meses: cache do dia
-    key = re.sub(r"\W", "_", path) + (f"_{date.today()}" if "available" in path else "")
-    f = CACHE / f"{key}.json"
-    try:                                                       # disco (OneDrive) pode travar: cai pra rede
-        return json.loads(f.read_text("utf-8"))
-    except (OSError, ValueError):
-        pass
-    r = None
-    for tent in range(4):
-        time.sleep(0.25 * (tent + 1))
-        try:
-            r = requests.get(f"{API}/{path}", headers=H, timeout=60)
-            if r.status_code in (200, 404):
-                break
-        except requests.RequestException:
-            r = None
-    data = r.json() if r is not None and r.ok else None
-    if r is not None and r.status_code in (200, 404):          # so guarda respostas definitivas
-        tmp = f.with_suffix(f".{uuid.uuid4().hex}.tmp")
-        try:                                                   # cache e so otimizacao: falha nao para o run
-            tmp.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
-            os.replace(tmp, f)
-        except OSError:
-            pass
+    key = path + (f"@{date.today()}" if "available" in path else "")
+    with LOCK:
+        if key in MEM:
+            return MEM[key]
+        row = DB.execute("SELECT v FROM c WHERE k=?", (key,)).fetchone()
+    if row:
+        data = json.loads(row[0])
+    else:
+        if not hasattr(LOCAL, "s"):                    # uma sessao HTTP por thread: reaproveita a conexao
+            LOCAL.s = requests.Session()
+            LOCAL.s.headers.update(H)
+        r = None
+        for espera in (0.2, 5, 20, 60, 120):           # 403/429/5xx = site pedindo calma: espera e tenta de novo
+            time.sleep(espera)
+            try:
+                r = LOCAL.s.get(f"{API}/{path}", timeout=60)
+                if r.status_code in (200, 404):
+                    break
+            except requests.RequestException:
+                r = None
+        if r is None or r.status_code not in (200, 404):
+            raise Falha(f"{path} -> {None if r is None else r.status_code}")
+        data = r.json() if r.ok else None
+        if True:                                        # so respostas definitivas (200/404) chegam aqui e vao pro cache
+            with LOCK:
+                DB.execute("INSERT OR REPLACE INTO c VALUES (?, ?)", (key, json.dumps(data, ensure_ascii=False)))
+    with LOCK:
+        MEM[key] = data
     return data
-
 
 def cnpj_of(x):
     d = re.sub(r"\D", "", x)
@@ -141,19 +142,50 @@ def explode(cnpj, ym, peso, caminho, out):
 def job(args):
     nome, cnpj, ym = args
     out = []
-    explode(cnpj, ym, 1.0, [(cnpj, nome)], out)
+    try:
+        explode(cnpj, ym, 1.0, [(cnpj, nome)], out)
+    except Falha:
+        return None                       # carteira incompleta: tenta de novo no fim
     return [dict(fundo=nome, mes=ym, **r) for r in out]
 
 
-CNPJ = {n: cnpj_of(x) for n, x in PEERS.items()}
-jobs = [(n, c, ym) for n, c in CNPJ.items() for ym in months(c) if not DESDE or ym >= DESDE]
+CNPJ, jobs = {}, []
+for n, x in PEERS.items():
+    try:
+        CNPJ[n] = cnpj_of(x)
+        jobs += [(n, CNPJ[n], ym) for ym in months(CNPJ[n]) if not DESDE or ym >= DESDE]
+    except (Falha, requests.RequestException, AttributeError) as e:
+        print(f"ATENCAO: {n} pulado ({e}); confira o link/CNPJ ou rode de novo mais tarde")
 print(f"{len(jobs)} carteiras (fundo x mes) para abrir")
-rows = []
+rows, falhas = [], []
 with ThreadPoolExecutor(THREADS) as ex:
     for i, r in enumerate(ex.map(job, jobs), 1):
-        rows += r
+        if r is None:
+            falhas.append(jobs[i - 1])
+        else:
+            rows += r
         if i % 25 == 0 or i == len(jobs):
             print(f"  {i}/{len(jobs)}  ({jobs[i - 1][0]} {jobs[i - 1][2]})")
+            with LOCK:
+                DB.commit()                      # grava o cache aos poucos: se cair, nao perde o que ja baixou
+with LOCK:
+    DB.commit()
+if falhas:                                # segunda passada, devagar, so no que falhou
+    print(f"{len(falhas)} carteiras falharam (site bloqueou); tentando de novo em 60s, uma por vez...")
+    time.sleep(60)
+    falhas, refazer = [], falhas
+    for j in refazer:
+        r = job(j)
+        if r is None:
+            falhas.append(j)
+        else:
+            rows += r
+    with LOCK:
+        DB.commit()
+if falhas:
+    print("ATENCAO: ficaram de fora (rode de novo mais tarde; o cache guarda o resto):")
+    for n, _, ym in falhas:
+        print("   ", n, ym)
 df = pd.DataFrame(rows)
 
 
@@ -174,6 +206,8 @@ for c in df.select_dtypes("object"):
 # ---------------------------------------------------------------- checks
 soma = df.groupby(["fundo", "mes"]).perc_pl.sum()
 print("soma do %PL por carteira: min", round(soma.min(), 4), "max", round(soma.max(), 4))
+if (soma < 99).any():
+    print("carteiras somando < 99% (dado da fonte, ex. cota sem %):", soma[soma < 99].round(2).to_dict())
 cruz = df[df.cnpj_veiculo.isin(CNPJ.values()) & (df.cnpj_veiculo != df.fundo.map(CNPJ))]
 print("peers investindo em outro peer:", "nenhum" if cruz.empty else cruz[["fundo", "veiculo"]].drop_duplicates().to_string())
 
@@ -209,6 +243,7 @@ def header(ws, cols, widths):
 
 
 wb = Workbook()
+wb._fonts = IndexedList([N])                 # Arial 10 como fonte padrao: nao precisa formatar celula por celula
 wb.remove(wb.active)
 
 # 1) uma aba por peer: mes > categoria > ativos agrupados
@@ -227,7 +262,7 @@ for nome, g in df.groupby("fundo", sort=False):
             ws.row_dimensions[r].outline_level = 1
             for (ativo, cod), a in ats.loc[cat].sort_values("perc_pl", ascending=False).iterrows():
                 last = put(ws, ["      " + ativo, cod, a.perc_pl, a.perc_pl / tot * 100 if tot else None, a.veiculo,
-                                a.mes_carteira], N, None, {3: PCT, 4: PCT})
+                                a.mes_carteira], fmt={3: PCT, 4: PCT})
             ws.row_dimensions.group(r + 1, last, outline_level=2, hidden=True)
 # 2) evolucao por categoria + graficos (7 maiores categorias no total + Outros; cor fixa por categoria)
 CURTO = {"Depósitos a prazo e outros títulos de IF": "Depósitos a prazo / IF",
@@ -247,7 +282,7 @@ ws = wb.create_sheet("evolucao", 0)
 gr = wb.create_sheet("graficos", 0)
 gr.append(["Composicao por categoria (% do PL, look-through). Dados em 'evolucao'."])
 gr["A1"].font = B
-for k, nome in enumerate(PEERS):
+for k, nome in enumerate(p for p in PEERS if p in ev.index.get_level_values(0)):
     t = ev.loc[nome]
     row0 = put(ws, [nome], B)
     put(ws, ["mes"] + SERIES, HF, FILL)
@@ -286,16 +321,6 @@ header(ws, ["categoria", "rank", "fundo", "mes", "ativo", "codigo", "% PL do fun
 for r in top10.itertuples(index=False):
     put(ws, list(r), fmt={7: PCT})
 
-# 4) dados
-ws = wb.create_sheet("dados")
-cols = list(df.columns)
-ws.append(cols)
-for r in df.itertuples(index=False):
-    ws.append(list(r))
-for c in ws[1]:
-    c.font, c.fill = HF, FILL
-t = Table(displayName="dados_tbl", ref=f"A1:{chr(64 + len(cols))}{len(df) + 1}")
-t.tableStyleInfo = TableStyleInfo(name="TableStyleLight1")
-ws.add_table(t)
 wb.save(OUT)
-print("salvo", OUT, len(df), "linhas")
+df.to_csv(OUT.replace(".xlsx", "_dados.csv"), index=False, sep=";", decimal=",", encoding="utf-8-sig")
+print("salvo", OUT, "e", OUT.replace(".xlsx", "_dados.csv"), len(df), "linhas")

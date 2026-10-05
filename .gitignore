@@ -1,4 +1,6 @@
 ﻿cache_maisretorno/
+cache_maisretorno.sqlite
 *.xlsx
+*.csv
 *.log
 __pycache__/
