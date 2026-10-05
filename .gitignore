@@ -1,0 +1,4 @@
+﻿cache_maisretorno/
+*.xlsx
+*.log
+__pycache__/
